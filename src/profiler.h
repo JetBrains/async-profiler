@@ -35,7 +35,7 @@ const char FULL_VERSION_STRING[] =
     "Async-profiler " PROFILER_VERSION " built on " __DATE__ "\n"
     "Copyright 2016-2020 Andrei Pangin\n";
 
-const int MAX_CALLTRACES    = 65536;
+const int MAX_CALLTRACES    = 2 * 65536;
 const int MAX_NATIVE_FRAMES = 128;
 const int RESERVED_FRAMES   = 4;
 const int MAX_NATIVE_LIBS   = 2048;
