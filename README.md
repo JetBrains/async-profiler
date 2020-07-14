@@ -227,20 +227,7 @@ and then attaching the agent again with stop command.
 
 ## Flame Graph visualization
 
-async-profiler provides out-of-the-box [Flame Graph](https://github.com/BrendanGregg/FlameGraph) support.
-Specify `-o svg` argument to dump profiling results as an interactive SVG
-immediately viewable in all mainstream browsers.
-Also, SVG output format will be chosen automatically if the target
-filename ends with `.svg`.
-
-```
-$ jps
-9234 Jps
-8983 Computey
-$ ./profiler.sh -d 30 -f /tmp/flamegraph.svg 8983
-```
-
-![Example](https://github.com/jvm-profiling-tools/async-profiler/blob/master/demo/SwingSet2.svg)
+Please use upstream async-profiler (https://github.com/jvm-profiling-tools/async-profiler) to generate svg Flame Graph.
 
 ## Profiler Options
 

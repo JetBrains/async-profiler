@@ -29,7 +29,6 @@
 #include "wallClock.h"
 #include "instrument.h"
 #include "itimer.h"
-#include "flameGraph.h"
 #include "flightRecorder.h"
 #include "frameName.h"
 #include "os.h"
@@ -950,33 +949,7 @@ void Profiler::dumpFlameGraph(std::ostream& out, Arguments& args, bool tree) {
     MutexLocker ml(_state_lock);
     if (_state != IDLE || _engine == NULL) return;
 
-    FlameGraph flamegraph(args._title, args._counter, args._width, args._height, args._minwidth, args._reverse);
-    FrameName fn(args, args._style, _thread_names_lock, _thread_names);
-
-    for (int i = 0; i < MAX_CALLTRACES; i++) {
-        CallTraceSample& trace = _traces[i];
-        if (trace._samples == 0 || excludeTrace(&fn, &trace)) continue;
-
-        u64 samples = (args._counter == COUNTER_SAMPLES ? trace._samples : trace._counter);
-
-        Trie* f = flamegraph.root();
-        if (trace._num_frames == 0) {
-            f = f->addChild("[frame_buffer_overflow]", samples);
-        } else if (args._reverse) {
-            for (int j = 0; j < trace._num_frames; j++) {
-                const char* frame_name = fn.name(_frame_buffer[trace._start_frame + j]);
-                f = f->addChild(frame_name, samples);
-            }
-        } else {
-            for (int j = trace._num_frames - 1; j >= 0; j--) {
-                const char* frame_name = fn.name(_frame_buffer[trace._start_frame + j]);
-                f = f->addChild(frame_name, samples);
-            }
-        }
-        f->addLeaf(samples);
-    }
-
-    flamegraph.dump(out, tree);
+    out << "Unsupported format, please use upstream async-profiler (https://github.com/jvm-profiling-tools/async-profiler) to generate Flame Graph or Tree." << std::endl;
 }
 
 void Profiler::dumpTraces(std::ostream& out, Arguments& args) {
