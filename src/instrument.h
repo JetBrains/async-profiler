@@ -38,8 +38,8 @@ class Instrument : public Engine {
         return "calls";
     }
 
-    bool requireNativeTrace() {
-        return false;
+    CStack cstack() {
+        return CSTACK_NO;
     }
 
     Error check(Arguments& args);
@@ -56,7 +56,7 @@ class Instrument : public Engine {
                                           jint class_data_len, const u8* class_data,
                                           jint* new_class_data_len, u8** new_class_data);
 
-    static void recordSample();
+    static void JNICALL recordSample(JNIEnv* jni, jobject unused);
 };
 
 #endif // _INSTRUMENT_H

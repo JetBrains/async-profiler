@@ -1,18 +1,22 @@
-PROFILER_VERSION=1.7
+PROFILER_VERSION=1.8.1
 JATTACH_VERSION=1.5
 JAVAC_RELEASE_VERSION=6
+PACKAGE_NAME=async-profiler-$(PROFILER_VERSION)-$(OS_TAG)-$(ARCH_TAG)
+PACKAGE_DIR=/tmp/$(PACKAGE_NAME)
 LIB_PROFILER=libasyncProfiler.so
 JATTACH=jattach
-BINARIES=build/$(LIB_PROFILER) build/$(JATTACH)
-PROFILER_JAR=async-profiler.jar
-CC=gcc
-CFLAGS=-O2
-CPP=g++
-CPPFLAGS=-O2
+API_JAR=async-profiler.jar
+CONVERTER_JAR=converter.jar
+CFLAGS=-O3 -fno-omit-frame-pointer
+CXXFLAGS=-O3 -fno-omit-frame-pointer
 INCLUDES=-I$(JAVA_HOME)/include
 LIBS=-ldl -lpthread
 JAVAC=$(JAVA_HOME)/bin/javac
 JAR=$(JAVA_HOME)/bin/jar
+SOURCES := $(wildcard src/*.cpp)
+HEADERS := $(wildcard src/*.h)
+API_SOURCES := $(wildcard src/api/one/profiler/*.java)
+CONVERTER_SOURCES := $(shell find src/converter -name '*.java')
 
 ifeq ($(JAVA_HOME),)
   export JAVA_HOME:=$(shell java -cp . JavaHome)
@@ -20,42 +24,67 @@ endif
 
 OS:=$(shell uname -s)
 ifeq ($(OS), Darwin)
-  CPPFLAGS += -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE
+  CXXFLAGS += -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE
   INCLUDES += -I$(JAVA_HOME)/include/darwin
-  RELEASE_TAG:=$(PROFILER_VERSION)-macos-x64
+  OS_TAG=macos
 else
   LIBS += -lrt
   INCLUDES += -I$(JAVA_HOME)/include/linux
-  RELEASE_TAG:=$(PROFILER_VERSION)-linux-x64
+  ifeq ($(findstring musl,$(shell ldd /bin/ls)),musl)
+    OS_TAG=linux-musl
+  else
+    OS_TAG=linux
+  endif
+endif
+
+ARCH:=$(shell uname -m)
+ifeq ($(ARCH),x86_64)
+  ARCH_TAG=x64
+else
+  ifeq ($(findstring arm,$(ARCH)),arm)
+    ARCH_TAG=arm
+  else
+    ARCH_TAG=x86
+  endif
 endif
 
 
-.PHONY: all binaries release test clean
+.PHONY: all release test clean
 
-all: build/$(PROFILER_JAR)
+all: build build/$(LIB_PROFILER) build/$(JATTACH) build/$(API_JAR) build/$(CONVERTER_JAR)
 
-release: async-profiler-$(RELEASE_TAG).tar.gz
+release: build $(PACKAGE_NAME).tar.gz
 
-async-profiler-$(RELEASE_TAG).tar.gz: $(BINARIES) build/$(PROFILER_JAR) profiler.sh LICENSE NOTICE *.md
-	chmod 755 build profiler.sh
-	chmod 644 LICENSE NOTICE *.md
-	tar cvzf $@ $^
+$(PACKAGE_NAME).tar.gz: build/$(LIB_PROFILER) build/$(JATTACH) \
+                        build/$(API_JAR) build/$(CONVERTER_JAR) \
+                        profiler.sh LICENSE NOTICE *.md
+	mkdir -p $(PACKAGE_DIR)
+	cp -r build profiler.sh LICENSE NOTICE *.md $(PACKAGE_DIR)
+	chmod -R 755 $(PACKAGE_DIR)
+	chmod 644 $(PACKAGE_DIR)/LICENSE $(PACKAGE_DIR)/NOTICE $(PACKAGE_DIR)/*.md $(PACKAGE_DIR)/build/*.jar
+	tar cvzf $@ -C $(PACKAGE_DIR)/.. $(PACKAGE_NAME)
+	rm -r $(PACKAGE_DIR)
 
-binaries: $(BINARIES)
-
-build/$(LIB_PROFILER): src/*.cpp src/*.h
+build:
 	mkdir -p build
-	$(CPP) $(CPPFLAGS) -DPROFILER_VERSION=\"$(PROFILER_VERSION)\" $(INCLUDES) -fPIC -shared -o $@ src/*.cpp $(LIBS)
+
+build/$(LIB_PROFILER): $(SOURCES) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -DPROFILER_VERSION=\"$(PROFILER_VERSION)\" $(INCLUDES) -fPIC -shared -o $@ $(SOURCES) $(LIBS)
 
 build/$(JATTACH): src/jattach/jattach.c
-	mkdir -p build
 	$(CC) $(CFLAGS) -DJATTACH_VERSION=\"$(JATTACH_VERSION)\" -o $@ $^
 
-build/$(PROFILER_JAR): src/java/one/profiler/*.java
-	mkdir -p build/classes
-	$(JAVAC) -source $(JAVAC_RELEASE_VERSION) -target $(JAVAC_RELEASE_VERSION) -d build/classes $^
-	$(JAR) cvf $@ -C build/classes .
-	rm -rf build/classes
+build/$(API_JAR): $(API_SOURCES)
+	mkdir -p build/api
+	$(JAVAC) -source $(JAVAC_RELEASE_VERSION) -target $(JAVAC_RELEASE_VERSION) -d build/api $^
+	$(JAR) cvf $@ -C build/api .
+	$(RM) -r build/api
+
+build/$(CONVERTER_JAR): $(CONVERTER_SOURCES) src/converter/MANIFEST.MF
+	mkdir -p build/converter
+	$(JAVAC) -source 7 -target 7 -d build/converter $(CONVERTER_SOURCES)
+	$(JAR) cvfm $@ src/converter/MANIFEST.MF -C build/converter .
+	$(RM) -r build/converter
 
 test: all
 	test/smoke-test.sh
@@ -65,4 +94,4 @@ test: all
 	echo "All tests passed"
 
 clean:
-	rm -rf build
+	$(RM) -r build

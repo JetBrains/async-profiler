@@ -304,6 +304,11 @@ class RingBuffer {
         _offset = (_offset + sizeof(u64)) & (PERF_PAGE_SIZE - 1);
         return *(u64*)(_start + _offset);
     }
+
+    u64 peek(unsigned long words) {
+        unsigned long peek_offset = (_offset + words * sizeof(u64)) & (PERF_PAGE_SIZE - 1);
+        return *(u64*)(_start + peek_offset);
+    }
 };
 
 
@@ -321,6 +326,7 @@ PerfEvent* PerfEvents::_events = NULL;
 PerfEventType* PerfEvents::_event_type = NULL;
 long PerfEvents::_interval;
 Ring PerfEvents::_ring;
+CStack PerfEvents::_cstack;
 bool PerfEvents::_print_extended_warning;
 
 bool PerfEvents::createForThread(int tid) {
@@ -361,6 +367,17 @@ bool PerfEvents::createForThread(int tid) {
     } else if (_ring == RING_KERNEL) {
         attr.exclude_user = 1;
     }
+
+#ifdef PERF_ATTR_SIZE_VER5
+    if (_cstack == CSTACK_LBR) {
+        attr.sample_type |= PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER;
+        attr.branch_sample_type = PERF_SAMPLE_BRANCH_USER | PERF_SAMPLE_BRANCH_CALL_STACK;
+        attr.sample_regs_user = 1ULL << PERF_REG_PC;
+        attr.exclude_callchain_user = 1;
+    }
+#else
+#warning "Compiling without LBR support. Kernel headers 4.1+ required"
+#endif
 
     int fd = syscall(__NR_perf_event_open, &attr, tid, -1, -1, 0);
     if (fd == -1) {
@@ -478,11 +495,23 @@ Error PerfEvents::check(Arguments& args) {
     attr.sample_type = PERF_SAMPLE_CALLCHAIN;
     attr.disabled = 1;
 
-    if (args._ring == RING_USER || !Symbols::haveKernelSymbols()) {
+    if (args._ring == RING_USER) {
         attr.exclude_kernel = 1;
     } else if (args._ring == RING_KERNEL) {
         attr.exclude_user = 1;
+    } else if (!Symbols::haveKernelSymbols()) {
+        Profiler::_instance.updateSymbols(true);
+        attr.exclude_kernel = Symbols::haveKernelSymbols() ? 0 : 1;
     }
+
+#ifdef PERF_ATTR_SIZE_VER5
+    if (args._cstack == CSTACK_LBR) {
+        attr.sample_type |= PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER;
+        attr.branch_sample_type = PERF_SAMPLE_BRANCH_USER | PERF_SAMPLE_BRANCH_CALL_STACK;
+        attr.sample_regs_user = 1ULL << PERF_REG_PC;
+        attr.exclude_callchain_user = 1;
+    }
+#endif
 
     int fd = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
     if (fd == -1) {
@@ -511,6 +540,7 @@ Error PerfEvents::start(Arguments& args) {
                         "  echo 1 > /proc/sys/kernel/perf_event_paranoid\n");
         _ring = RING_USER;
     }
+    _cstack = args._cstack;
     _print_extended_warning = _ring != RING_USER;
 
     int max_events = OS::getMaxThreadId();
@@ -567,22 +597,51 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
             struct perf_event_header* hdr = ring.seek(tail);
             if (hdr->type == PERF_RECORD_SAMPLE) {
                 u64 nr = ring.next();
-                while (nr-- > 0 && depth < max_depth) {
+                while (nr-- > 0) {
                     u64 ip = ring.next();
                     if (ip < PERF_CONTEXT_MAX) {
                         const void* iptr = (const void*)ip;
-                        callchain[depth++] = iptr;
-                        if (java_methods->contains(iptr) || runtime_stubs->contains(iptr)) {
+                        if (java_methods->contains(iptr) || runtime_stubs->contains(iptr) || depth >= max_depth) {
                             // Stop at the first Java frame
-                            break;
+                            goto stack_complete;
                         }
+                        callchain[depth++] = iptr;
                     }
                 }
+
+                if (_cstack == CSTACK_LBR) {
+                    u64 bnr = ring.next();
+
+                    // Last userspace PC is stored right after branch stack
+                    const void* pc = (const void*)ring.peek(bnr * 3 + 2);
+                    if (java_methods->contains(pc) || runtime_stubs->contains(pc) || depth >= max_depth) {
+                        goto stack_complete;
+                    }
+                    callchain[depth++] = pc;
+
+                    while (bnr-- > 0) {
+                        const void* from = (const void*)ring.next();
+                        const void* to = (const void*)ring.next();
+                        ring.next();
+
+                        if (java_methods->contains(to) || runtime_stubs->contains(to) || depth >= max_depth) {
+                            goto stack_complete;
+                        }
+                        callchain[depth++] = to;
+
+                        if (java_methods->contains(from) || runtime_stubs->contains(from) || depth >= max_depth) {
+                            goto stack_complete;
+                        }
+                        callchain[depth++] = from;
+                    }
+                }
+
                 break;
             }
             tail += hdr->size;
         }
 
+stack_complete:
         page->data_tail = head;
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Andrei Pangin
+ * Copyright 2020 Andrei Pangin
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,17 @@
  * limitations under the License.
  */
 
-#ifndef _SYMBOLS_H
-#define _SYMBOLS_H
+/**
+ * Main entry point of jar.
+ * Lists available converters.
+ */
+public class Main {
 
-#include <set>
-#include "codeCache.h"
-#include "mutex.h"
-
-
-class Symbols {
-  private:
-    static Mutex _parse_lock;
-    static std::set<const void*> _parsed_libraries;
-    static bool _have_kernel_symbols;
-
-  public:
-    static void parseKernelSymbols(NativeCodeCache* cc);
-    static void parseLibraries(NativeCodeCache** array, volatile int& count, int size, bool kernel_symbols);
-
-    static bool haveKernelSymbols() {
-        return _have_kernel_symbols;
+    public static void main(String[] args) {
+        System.out.println("Usage: java -cp converter.jar <Converter> [options] <input> <output>");
+        System.out.println();
+        System.out.println("Available converters:");
+        System.out.println("  FlameGraph input.collapsed output.html");
+        System.out.println("  jfr2nflx   input.jfr       output.nflx");
     }
-};
-
-#endif // _SYMBOLS_H
+}

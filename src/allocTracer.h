@@ -30,10 +30,11 @@ class Trap {
   private:
     const char* _func_name;
     instruction_t* _entry;
+    instruction_t _breakpoint_insn;
     instruction_t _saved_insn;
 
   public:
-    Trap(const char* func_name) : _func_name(func_name), _entry(NULL) {
+    Trap(const char* func_name) : _func_name(func_name), _entry(NULL), _breakpoint_insn(BREAKPOINT) {
     }
 
     bool resolve(NativeCodeCache* libjvm);
@@ -53,7 +54,6 @@ class AllocTracer : public Engine {
     static Trap _in_new_tlab2;
     static Trap _outside_tlab2;
 
-    static bool _supports_class_names;
     static u64 _interval;
     static volatile u64 _allocated_bytes;
 
@@ -69,8 +69,8 @@ class AllocTracer : public Engine {
         return "bytes";
     }
 
-    bool requireNativeTrace() {
-        return false;
+    CStack cstack() {
+        return CSTACK_NO;
     }
 
     Error check(Arguments& args);

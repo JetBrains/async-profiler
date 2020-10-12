@@ -22,12 +22,16 @@ Error Engine::check(Arguments& args) {
     return Error::OK;
 }
 
-bool Engine::requireNativeTrace() {
-    return true;
+CStack Engine::cstack() {
+    return CSTACK_FP;
 }
 
 int Engine::getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
                            CodeCache* java_methods, CodeCache* runtime_stubs) {
+    if (ucontext == NULL) {
+        return 0;
+    }
+
     StackFrame frame(ucontext);
     const void* pc = (const void*)frame.pc();
     uintptr_t fp = frame.fp();
@@ -38,11 +42,11 @@ int Engine::getNativeTrace(void* ucontext, int tid, const void** callchain, int 
 
     // Walk until the bottom of the stack or until the first Java frame
     while (depth < max_depth && pc >= valid_pc) {
-        callchain[depth++] = pc;
-
         if (java_methods->contains(pc) || runtime_stubs->contains(pc)) {
             break;
         }
+
+        callchain[depth++] = pc;
 
         // Check if the next frame is below on the current stack
         if (fp <= prev_fp || fp >= prev_fp + 0x40000) {

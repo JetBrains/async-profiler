@@ -47,6 +47,20 @@ static ITimer itimer;
 static Instrument instrument;
 
 
+// Stack recovery techniques used to workaround AsyncGetCallTrace flaws.
+// Can be disabled with 'safemode' option.
+enum StackRecovery {
+    MOVE_SP      = 1,
+    POP_FRAME    = 2,
+    SCAN_STACK   = 4,
+    LAST_JAVA_PC = 8,
+    GC_TRACES    = 16,
+
+    HOTSPOT_ONLY = LAST_JAVA_PC | GC_TRACES,
+    MAX_RECOVERY = MOVE_SP | POP_FRAME | SCAN_STACK | LAST_JAVA_PC | GC_TRACES
+};
+
+
 u64 Profiler::hashCallTrace(int num_frames, ASGCT_CallFrame* frames) {
     const u64 M = 0xc6a4a7935bd1e995ULL;
     const int R = 47;
@@ -207,6 +221,10 @@ const char* Profiler::asgctError(int code) {
     }
 }
 
+void Profiler::updateSymbols(bool kernel_symbols) {
+    Symbols::parseLibraries(_native_libs, _native_lib_count, MAX_NATIVE_LIBS, kernel_symbols);
+}
+
 const void* Profiler::findSymbol(const char* name) {
     const int native_lib_count = _native_lib_count;
     for (int i = 0; i < native_lib_count; i++) {
@@ -244,26 +262,27 @@ const char* Profiler::findNativeMethod(const void* address) {
     return lib == NULL ? NULL : lib->binarySearch(address);
 }
 
-int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int tid, bool* stopped_at_java_frame) {
+int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int tid) {
     const void* native_callchain[MAX_NATIVE_FRAMES];
     int native_frames = _engine->getNativeTrace(ucontext, tid, native_callchain, MAX_NATIVE_FRAMES,
                                                 &_java_methods, &_runtime_stubs);
 
-    *stopped_at_java_frame = false;
-    if (native_frames > 0) {
-        const void* last_pc = native_callchain[native_frames - 1];
-        if (_java_methods.contains(last_pc) || _runtime_stubs.contains(last_pc)) {
-            *stopped_at_java_frame = true;
-            native_frames--;
+    int depth = 0;
+    jmethodID prev_method = NULL;
+
+    for (int i = 0; i < native_frames; i++) {
+        jmethodID current_method = (jmethodID)findNativeMethod(native_callchain[i]);
+        if (current_method == prev_method && _cstack == CSTACK_LBR) {
+            // Skip duplicates in LBR stack, where branch_stack[N].from == branch_stack[N+1].to
+            prev_method = NULL;
+        } else {
+            frames[depth].bci = BCI_NATIVE_FRAME;
+            frames[depth].method_id = prev_method = current_method;
+            depth++;
         }
     }
 
-    for (int i = 0; i < native_frames; i++) {
-        frames[i].bci = BCI_NATIVE_FRAME;
-        frames[i].method_id = (jmethodID)findNativeMethod(native_callchain[i]);
-    }
-
-    return native_frames;
+    return depth;
 }
 
 int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max_depth) {
@@ -276,8 +295,7 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
     ASGCT_CallTrace trace = {jni, 0, frames};
     VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
 
-#ifndef SAFE_MODE
-    if (trace.num_frames == ticks_unknown_Java || trace.num_frames == ticks_not_walkable_Java) {
+    if ((trace.num_frames == ticks_unknown_Java || trace.num_frames == ticks_not_walkable_Java) && _safe_mode < MAX_RECOVERY) {
         // If current Java stack is not walkable (e.g. the top frame is not fully constructed),
         // try to manually pop the top frame off, hoping that the previous frame is walkable.
         // This is a temporary workaround for AsyncGetCallTrace issues,
@@ -289,13 +307,15 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
 
         // Stack might not be walkable if some temporary values are pushed onto the stack
         // above the expected frame SP
-        for (int extra_stack_slots = 1; extra_stack_slots <= 2; extra_stack_slots++) {
-            top_frame.sp() = sp + extra_stack_slots * sizeof(uintptr_t);
-            VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
-            top_frame.sp() = sp;
+        if (!(_safe_mode & MOVE_SP)) {
+            for (int extra_stack_slots = 1; extra_stack_slots <= 2; extra_stack_slots++) {
+                top_frame.sp() = sp + extra_stack_slots * sizeof(uintptr_t);
+                VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
+                top_frame.sp() = sp;
 
-            if (trace.num_frames > 0) {
-                return trace.num_frames;
+                if (trace.num_frames > 0) {
+                    return trace.num_frames;
+                }
             }
         }
 
@@ -305,7 +325,7 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
             bool is_native_frame = trace.frames->bci == BCI_NATIVE_FRAME;
             is_entry_frame = is_native_frame && strcmp((const char*)trace.frames->method_id, "call_stub") == 0;
 
-            if (!is_native_frame || _cstack) {
+            if (!is_native_frame || _cstack != CSTACK_NO) {
                 trace.frames++;
                 max_depth--;
             }
@@ -315,7 +335,7 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
         if (top_frame.validSP()) {
             // Retry with the fixed context, but only if PC looks reasonable,
             // otherwise AsyncGetCallTrace may crash
-            if (top_frame.pop(is_entry_frame)) {
+            if (!(_safe_mode & POP_FRAME) && top_frame.pop(is_entry_frame)) {
                 if (getAddressType((instruction_t*)top_frame.pc()) != ADDR_UNKNOWN) {
                     VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
                 }
@@ -328,20 +348,22 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
 
             // Try to find the previous frame by looking a few top stack slots
             // for something that resembles a return address
-            for (int slot = 0; slot < StackFrame::callerLookupSlots(); slot++) {
-                if (getAddressType((instruction_t*)top_frame.stackAt(slot)) != ADDR_UNKNOWN) {
-                    top_frame.pc() = top_frame.stackAt(slot);
-                    top_frame.sp() = sp + (slot + 1) * sizeof(uintptr_t);
-                    VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
-                    top_frame.restore(pc, sp, fp);
+            if (!(_safe_mode & SCAN_STACK)) {
+                for (int slot = 0; slot < StackFrame::callerLookupSlots(); slot++) {
+                    if (getAddressType((instruction_t*)top_frame.stackAt(slot)) != ADDR_UNKNOWN) {
+                        top_frame.pc() = top_frame.stackAt(slot);
+                        top_frame.sp() = sp + (slot + 1) * sizeof(uintptr_t);
+                        VM::_asyncGetCallTrace(&trace, max_depth, ucontext);
+                        top_frame.restore(pc, sp, fp);
 
-                    if (trace.num_frames > 0) {
-                        return trace.num_frames + (trace.frames - frames);
+                        if (trace.num_frames > 0) {
+                            return trace.num_frames + (trace.frames - frames);
+                        }
                     }
                 }
             }
         }
-    } else if (trace.num_frames == ticks_unknown_not_Java && VM::is_hotspot()) {
+    } else if (trace.num_frames == ticks_unknown_not_Java && !(_safe_mode & LAST_JAVA_PC)) {
         VMThread* thread = VMThread::fromEnv(jni);
         if (thread != NULL) {
             uintptr_t& sp = thread->lastJavaSP();
@@ -356,8 +378,8 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
                 if (addr_type != ADDR_UNKNOWN) {
                     // AGCT fails if the last Java frame is a Runtime Stub with an invalid _frame_complete_offset.
                     // In this case we manually replace last Java frame to the previous frame
-                    if (addr_type == ADDR_STUB && _CodeCache_find_blob != NULL) {
-                        RuntimeStub* stub = (RuntimeStub*) _CodeCache_find_blob((instruction_t*)pc);
+                    if (addr_type == ADDR_STUB) {
+                        RuntimeStub* stub = RuntimeStub::findBlob((instruction_t*)pc);
                         if (stub != NULL && stub->frameSize() > 0 && stub->frameSize() < 256) {
                             sp = saved_sp + stub->frameSize() * sizeof(uintptr_t);
                             pc = ((uintptr_t*)sp)[-1];
@@ -370,11 +392,10 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
                 pc = 0;
             }
         }
-    } else if (trace.num_frames == ticks_GC_active && VM::is_hotspot() && _JvmtiEnv_GetStackTrace != NULL) {
+    } else if (trace.num_frames == ticks_GC_active && VMStructs::_get_stack_trace != NULL && !(_safe_mode & GC_TRACES)) {
         // While GC is running Java threads are known to be at safepoint
         return getJavaTraceJvmti((jvmtiFrameInfo*)frames, frames, max_depth);
     }
-#endif // SAFE_MODE
 
     if (trace.num_frames > 0) {
         return trace.num_frames;
@@ -403,7 +424,7 @@ int Profiler::getJavaTraceJvmti(jvmtiFrameInfo* jvmti_frames, ASGCT_CallFrame* f
 
     VMThread* vm_thread = VMThread::fromEnv(jni);
     int num_frames;
-    if (_JvmtiEnv_GetStackTrace(NULL, vm_thread, 0, max_depth, jvmti_frames, &num_frames) == 0 && num_frames > 0) {
+    if (VMStructs::_get_stack_trace(NULL, vm_thread, 0, max_depth, jvmti_frames, &num_frames) == 0 && num_frames > 0) {
         // Profiler expects stack trace in AsyncGetCallTrace format; convert it now
         for (int i = 0; i < num_frames; i++) {
             frames[i].method_id = jvmti_frames[i].method;
@@ -504,21 +525,20 @@ void Profiler::recordSample(void* ucontext, u64 counter, jint event_type, jmetho
     atomicInc(_total_counter, counter);
 
     ASGCT_CallFrame* frames = _calltrace_buffer[lock_index]->_asgct_frames;
-    bool need_java_trace = true;
 
     int num_frames = 0;
     if (event != NULL) {
         num_frames = makeEventFrame(frames, event_type, event);
     }
-    if (_cstack) {
-        num_frames += getNativeTrace(ucontext, frames + num_frames, tid, &need_java_trace);
+    if (_cstack != CSTACK_NO) {
+        num_frames += getNativeTrace(ucontext, frames + num_frames, tid);
     }
 
-    if (event_type != 0 && _JvmtiEnv_GetStackTrace != NULL) {
+    if (event_type != 0 && VMStructs::_get_stack_trace != NULL) {
         // Events like object allocation happen at known places where it is safe to call JVM TI
         jvmtiFrameInfo* jvmti_frames = _calltrace_buffer[lock_index]->_jvmti_frames;
         num_frames += getJavaTraceJvmti(jvmti_frames + num_frames, frames + num_frames, _max_stack_depth);
-    } else if (OS::isSignalSafeTLS() || need_java_trace) {
+    } else if (VMStructs::hasJNIEnv()) {
         num_frames += getJavaTraceAsync(ucontext, frames + num_frames, _max_stack_depth);
     }
 
@@ -543,7 +563,7 @@ void Profiler::recordSample(void* ucontext, u64 counter, jint event_type, jmetho
 
 jboolean JNICALL Profiler::NativeLibraryLoadTrap(JNIEnv* env, jobject self, jstring name, jboolean builtin) {
     jboolean result = _instance._original_NativeLibrary_load(env, self, name, builtin);
-    Symbols::parseLibraries(_instance._native_libs, _instance._native_lib_count, MAX_NATIVE_LIBS);
+    _instance.updateSymbols(false);
     return result;
 }
 
@@ -713,34 +733,16 @@ Engine* Profiler::selectEngine(const char* event_name) {
     }
 }
 
-Error Profiler::initJvmLibrary() {
-    if (_libjvm != NULL) {
-        return Error::OK;
+Error Profiler::checkJvmCapabilities() {
+    if (VMStructs::libjvm() == NULL) {
+        return Error("Could not find libjvm among loaded libraries. Unsupported JVM?");
     }
 
-    if (VM::_asyncGetCallTrace == NULL) {
-        return Error("Could not find AsyncGetCallTrace function");
-    }
-
-    _libjvm = findNativeLibrary((const void*)VM::_asyncGetCallTrace);
-    if (_libjvm == NULL) {
-        return Error("Could not find libjvm among loaded libraries");
-    }
-
-    VMStructs::init(_libjvm);
-    if (!VMStructs::initThreadBridge()) {
+    if (!VMStructs::hasThreadBridge()) {
         return Error("Could not find VMThread bridge. Unsupported JVM?");
     }
 
-    _JvmtiEnv_GetStackTrace = (jvmtiError (*)(void*, void*, jint, jint, jvmtiFrameInfo*, jint*))
-        _libjvm->findSymbol("_ZN8JvmtiEnv13GetStackTraceEP10JavaThreadiiP15_jvmtiFrameInfoPi");
-
-    _CodeCache_find_blob = (const void* (*)(const void*)) _libjvm->findSymbol("_ZN9CodeCache16find_blob_unsafeEPv");
-    if (_CodeCache_find_blob == NULL) {
-        _CodeCache_find_blob = (const void* (*)(const void*)) _libjvm->findSymbol("_ZN9CodeCache9find_blobEPv");
-    }
-
-    if (_CodeCache_find_blob == NULL) {
+    if (VMStructs::_get_stack_trace == NULL) {
         fprintf(stderr, "WARNING: Install JVM debug symbols to improve profile accuracy\n");
     }
 
@@ -751,6 +753,11 @@ Error Profiler::start(Arguments& args, bool reset) {
     MutexLocker ml(_state_lock);
     if (_state != IDLE) {
         return Error("Profiler already started");
+    }
+
+    Error error = checkJvmCapabilities();
+    if (error) {
+        return error;
     }
 
     if (reset || _start_time == 0) {
@@ -803,15 +810,19 @@ Error Profiler::start(Arguments& args, bool reset) {
         }
     }
 
-    Symbols::parseLibraries(_native_libs, _native_lib_count, MAX_NATIVE_LIBS);
-    Error error = initJvmLibrary();
-    if (error) {
-        return error;
-    }
+    updateSymbols(args._ring != RING_USER);
+
+    _safe_mode = args._safe_mode | (VM::hotspot_version() ? 0 : HOTSPOT_ONLY);
 
     _add_thread_frame = args._threads && args._output != OUTPUT_JFR;
     _update_thread_names = (args._threads || args._output == OUTPUT_JFR) && VMThread::hasNativeId();
     _thread_filter.init(args._filter);
+
+    _engine = selectEngine(args._event);
+    _cstack = args._cstack == CSTACK_DEFAULT ? _engine->cstack() : args._cstack;
+    if (_cstack == CSTACK_LBR && _engine != &perf_events) {
+        return Error("Branch stack is supported only with PMU events");
+    }
 
     if (args._output == OUTPUT_JFR) {
         error = _jfr.start(args._file);
@@ -819,9 +830,6 @@ Error Profiler::start(Arguments& args, bool reset) {
             return error;
         }
     }
-
-    _engine = selectEngine(args._event);
-    _cstack = args._cstack ? args._cstack == 'y' : _engine->requireNativeTrace();
 
     error = _engine->start(args);
     if (error) {
@@ -866,8 +874,7 @@ Error Profiler::check(Arguments& args) {
         return Error("Profiler already started");
     }
 
-    Symbols::parseLibraries(_native_libs, _native_lib_count, MAX_NATIVE_LIBS);
-    Error error = initJvmLibrary();
+    Error error = checkJvmCapabilities();
     if (error) {
         return error;
     }

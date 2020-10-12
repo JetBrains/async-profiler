@@ -61,6 +61,13 @@ enum Style {
     STYLE_ANNOTATE   = 8
 };
 
+enum CStack {
+    CSTACK_DEFAULT,
+    CSTACK_NO,
+    CSTACK_FP,
+    CSTACK_LBR
+};
+
 enum Output {
     OUTPUT_NONE,
     OUTPUT_TEXT,
@@ -110,13 +117,14 @@ class Arguments {
     long _interval;
     int  _jstackdepth;
     int _framebuf;
+    int _safe_mode;
     const char* _file;
     const char* _filter;
     int _include;
     int _exclude;
     bool _threads;
-    char _cstack;
     int _style;
+    CStack _cstack;
     Output _output;
     int _dump_traces;
     int _dump_flat;
@@ -136,13 +144,14 @@ class Arguments {
         _interval(0),
         _jstackdepth(DEFAULT_JSTACKDEPTH),
         _framebuf(DEFAULT_FRAMEBUF),
+        _safe_mode(0),
         _file(NULL),
         _filter(NULL),
         _include(0),
         _exclude(0),
         _threads(false),
-        _cstack(0),
         _style(0),
+        _cstack(CSTACK_DEFAULT),
         _output(OUTPUT_NONE),
         _dump_traces(0),
         _dump_flat(0),

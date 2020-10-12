@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.8.1] - 2020-09-05
+
+### Improvements
+ - Possibility to specify application name instead of `pid` (contributed by @yuzawa-san)
+
+### Bug fixes
+ - Fixed long attach time and slow class loading on JDK 8
+ - `UnsatisfiedLinkError` during Java method profiling
+ - Avoid reading `/proc/kallsyms` when `--all-user` is specified
+
+## [1.8] - 2020-08-10
+
+### Features
+ - Converters between different output formats:
+   - JFR -> nflx (FlameScope)
+   - Collapsed stacks -> HTML 5 Flame Graph 
+
+### Improvements
+ - `profiler.sh` no longer requires bash (contributed by @cfstras)
+ - Fixed long attach time and slow class loading on JDK 8
+ - Fixed deadlocks in wall-clock profiling mode
+ - Per-thread reverse Flame Graph and Call Tree
+ - ARM build now works with ARM and THUMB flavors of JDK
+
+### Changes
+ - Release package is extracted into a separate folder
+
+## [1.7.1] - 2020-05-14
+
+### Features
+ - LBR call stack support (available since Haswell)
+
+### Improvements
+ - `--filter` to profile only specified thread IDs in wall-clock mode
+ - `--safe-mode` to disable selected stack recovery techniques
+
 ## [1.7] - 2020-03-17
 
 ### Features

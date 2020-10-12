@@ -29,7 +29,6 @@ Trap AllocTracer::_outside_tlab("_ZN11AllocTracer34send_allocation_outside_tlab_
 Trap AllocTracer::_in_new_tlab2("_ZN11AllocTracer27send_allocation_in_new_tlab");
 Trap AllocTracer::_outside_tlab2("_ZN11AllocTracer28send_allocation_outside_tlab");
 
-bool AllocTracer::_supports_class_names = false;
 u64 AllocTracer::_interval;
 volatile u64 AllocTracer::_allocated_bytes;
 
@@ -40,23 +39,32 @@ bool Trap::resolve(NativeCodeCache* libjvm) {
         return true;
     }
 
-    _entry = (instruction_t*)libjvm->findSymbolByPrefix(_func_name);
-    if (_entry != NULL) {
-        // Make the entry point writable, so we can rewrite instructions
-        long page_size = sysconf(_SC_PAGESIZE);
-        uintptr_t page_start = (uintptr_t)_entry & -page_size;
-        mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
-        return true;
+    uintptr_t addr = (uintptr_t)libjvm->findSymbolByPrefix(_func_name);
+    if (addr == 0) {
+        return false;
     }
 
-    return false;
+#if defined(__arm__) || defined(__thumb__)
+    if (addr & 1) {
+        addr ^= 1;
+        _breakpoint_insn = BREAKPOINT_THUMB;
+    }
+#endif
+
+    // Make the entry point writable, so we can rewrite instructions
+    long page_size = sysconf(_SC_PAGESIZE);
+    uintptr_t page_start = addr & -page_size;
+    mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    _entry = (instruction_t*)addr;
+    return true;
 }
 
 // Insert breakpoint at the very first instruction
 void Trap::install() {
     if (_entry != NULL) {
         _saved_insn = *_entry;
-        *_entry = BREAKPOINT;
+        *_entry = _breakpoint_insn;
         flushCache(_entry);
     }
 }
@@ -111,7 +119,7 @@ void AllocTracer::recordAllocation(void* ucontext, StackFrame& frame, uintptr_t 
         }
     }
 
-    if (_supports_class_names) {
+    if (VMStructs::hasClassNames()) {
         VMSymbol* symbol = VMKlass::fromHandle(rklass)->name();
         if (outside_tlab) {
             // Invert the last bit to distinguish jmethodID from the allocation in new TLAB
@@ -125,7 +133,7 @@ void AllocTracer::recordAllocation(void* ucontext, StackFrame& frame, uintptr_t 
 }
 
 Error AllocTracer::check(Arguments& args) {
-    NativeCodeCache* libjvm = Profiler::_instance.jvmLibrary();
+    NativeCodeCache* libjvm = VMStructs::libjvm();
     if (!(_in_new_tlab.resolve(libjvm) || _in_new_tlab2.resolve(libjvm)) ||
         !(_outside_tlab.resolve(libjvm) || _outside_tlab2.resolve(libjvm))) {
         return Error("No AllocTracer symbols found. Are JDK debug symbols installed?");
@@ -140,7 +148,6 @@ Error AllocTracer::start(Arguments& args) {
         return error;
     }
 
-    _supports_class_names =  VMStructs::available();
     _interval = args._interval;
     _allocated_bytes = 0;
 
