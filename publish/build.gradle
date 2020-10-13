@@ -36,7 +36,7 @@ def checkHaveAllBinaries(String path) {
 sourceSets {
     main {
         java {
-            srcDirs file("$projectDir/../src/java")
+            srcDirs file("$projectDir/../src/api")
         }
     }
 }
