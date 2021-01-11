@@ -36,10 +36,13 @@ int VMStructs::_class_loader_data_offset = -1;
 int VMStructs::_methods_offset = -1;
 int VMStructs::_thread_osthread_offset = -1;
 int VMStructs::_thread_anchor_offset = -1;
+int VMStructs::_thread_state_offset = -1;
 int VMStructs::_osthread_id_offset = -1;
 int VMStructs::_anchor_sp_offset = -1;
 int VMStructs::_anchor_pc_offset = -1;
 int VMStructs::_frame_size_offset = -1;
+int VMStructs::_is_gc_active_offset = -1;
+char* VMStructs::_collected_heap_addr = NULL;
 
 jfieldID VMStructs::_eetop;
 jfieldID VMStructs::_tid;
@@ -68,7 +71,11 @@ void VMStructs::init(NativeCodeCache* libjvm) {
 
     initOffsets();
     initJvmFunctions();
-    initThreadBridge();
+
+    JNIEnv* env = VM::jni();
+    initThreadBridge(env);
+    initLogging(env);
+    env->ExceptionClear();
 }
 
 void VMStructs::initOffsets() {
@@ -118,6 +125,8 @@ void VMStructs::initOffsets() {
                 _thread_osthread_offset = *(int*)(entry + offset_offset);
             } else if (strcmp(field, "_anchor") == 0) {
                 _thread_anchor_offset = *(int*)(entry + offset_offset);
+            } else if (strcmp(field, "_thread_state") == 0) {
+                _thread_state_offset = *(int*)(entry + offset_offset);
             }
         } else if (strcmp(type, "OSThread") == 0) {
             if (strcmp(field, "_thread_id") == 0) {
@@ -133,6 +142,14 @@ void VMStructs::initOffsets() {
             if (strcmp(field, "_frame_size") == 0) {
                 _frame_size_offset = *(int*)(entry + offset_offset);
             }
+        } else if (strcmp(type, "Universe") == 0) {
+            if (strcmp(field, "_collectedHeap") == 0) {
+                _collected_heap_addr = **(char***)(entry + address_offset);
+            }
+        } else if (strcmp(type, "CollectedHeap") == 0) {
+            if (strcmp(field, "_is_gc_active") == 0) {
+                _is_gc_active_offset = *(int*)(entry + offset_offset);
+            }
         } else if (strcmp(type, "PermGen") == 0) {
             _has_perm_gen = true;
         }
@@ -147,8 +164,10 @@ void VMStructs::initOffsets() {
 }
 
 void VMStructs::initJvmFunctions() {
-    _get_stack_trace =
-        (GetStackTraceFunc)_libjvm->findSymbol("_ZN8JvmtiEnv13GetStackTraceEP10JavaThreadiiP15_jvmtiFrameInfoPi");
+    _get_stack_trace = (GetStackTraceFunc)_libjvm->findSymbol("_ZN8JvmtiEnv13GetStackTraceEP10JavaThreadiiP15_jvmtiFrameInfoPi");
+    if (_get_stack_trace == NULL) {
+        _get_stack_trace = (GetStackTraceFunc)_libjvm->findSymbol("_ZN8JvmtiEnv13GetStackTraceEP10JavaThreadiiP14jvmtiFrameInfoPi");
+    }
 
     _unsafe_park = (UnsafeParkFunc)_libjvm->findSymbol("Unsafe_Park");
     if (_unsafe_park == NULL) {
@@ -170,14 +189,13 @@ void VMStructs::initJvmFunctions() {
     }
 }
 
-void VMStructs::initThreadBridge() {
+void VMStructs::initThreadBridge(JNIEnv* env) {
     // Get eetop field - a bridge from Java Thread to VMThread
     jthread thread;
     if (VM::jvmti()->GetCurrentThread(&thread) != 0) {
         return;
     }
 
-    JNIEnv* env = VM::jni();
     jclass thread_class = env->GetObjectClass(thread);
     _eetop = env->GetFieldID(thread_class, "eetop", "J");
     _tid = env->GetFieldID(thread_class, "tid", "J");
@@ -192,19 +210,31 @@ void VMStructs::initThreadBridge() {
 
     // Workaround for JDK-8132510: it's not safe to call GetEnv() inside a signal handler
     // since JDK 9, so we do it only for threads already registered in ThreadLocalStorage
-    if (VM::hotspot_version() >= 9) {
-        for (int i = 0; i < 1024; i++) {
-            if (pthread_getspecific((pthread_key_t)i) == vm_thread) {
-                _tls_index = i;
-                break;
-            }
+    for (int i = 0; i < 1024; i++) {
+        if (pthread_getspecific((pthread_key_t)i) == vm_thread) {
+            _tls_index = i;
+            break;
         }
+    }
+
+    if (_tls_index < 0) {
+        return;
     }
 
     _env_offset = (intptr_t)env - (intptr_t)vm_thread;
     _has_thread_bridge = true;
 }
 
-bool VMStructs::hasJNIEnv() {
-    return _tls_index < 0 || pthread_getspecific((pthread_key_t)_tls_index) != NULL;
+void VMStructs::initLogging(JNIEnv* env) {
+    // Workaround for JDK-8238460
+    if (VM::hotspot_version() >= 15) {
+        VMManagement* management = VM::management();
+        if (management != NULL) {
+            management->ExecuteDiagnosticCommand(env, env->NewStringUTF("VM.log what=jni+resolve=error"));
+        }
+    }
+}
+
+VMThread* VMThread::current() {
+    return (VMThread*)pthread_getspecific((pthread_key_t)_tls_index);
 }

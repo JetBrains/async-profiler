@@ -16,6 +16,7 @@
 
 #include <fstream>
 #include <dlfcn.h>
+#include <stdlib.h>
 #include <string.h>
 #include "vmEntry.h"
 #include "arguments.h"
@@ -35,6 +36,10 @@ int VM::_hotspot_version = 0;
 void* VM::_libjvm;
 void* VM::_libjava;
 AsyncGetCallTrace VM::_asyncGetCallTrace;
+JVM_GetManagement VM::_getManagement;
+jvmtiError (JNICALL *VM::_orig_RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
+jvmtiError (JNICALL *VM::_orig_RetransformClasses)(jvmtiEnv*, jint, const jclass* classes);
+volatile int VM::_in_redefine_classes = 0;
 
 
 void VM::init(JavaVM* vm, bool attach) {
@@ -51,15 +56,30 @@ void VM::init(JavaVM* vm, bool attach) {
         _jvmti->Deallocate((unsigned char*)prop);
 
         if (is_hotspot && _jvmti->GetSystemProperty("java.vm.version", &prop) == 0) {
-            _hotspot_version = strncmp(prop, "25.", 3) == 0 ? 8 :
-                               strncmp(prop, "24.", 3) == 0 ? 7 :
-                               strncmp(prop, "20.", 3) == 0 ? 6 : 9;
+            if (strncmp(prop, "25.", 3) == 0) {
+                _hotspot_version = 8;
+            } else if (strncmp(prop, "24.", 3) == 0) {
+                _hotspot_version = 7;
+            } else if (strncmp(prop, "20.", 3) == 0) {
+                _hotspot_version = 6;
+            } else if ((_hotspot_version = atoi(prop)) < 9) {
+                _hotspot_version = 9;
+            }
             _jvmti->Deallocate((unsigned char*)prop);
+        }
+
+        if (is_hotspot) {
+            JVMTIFunctions* functions = *(JVMTIFunctions**)_jvmti;
+            _orig_RedefineClasses = functions->RedefineClasses;
+            _orig_RetransformClasses = functions->RetransformClasses;
+            functions->RedefineClasses = RedefineClassesHook;
+            functions->RetransformClasses = RetransformClassesHook;
         }
     }
 
     _libjvm = getLibraryHandle("libjvm.so");
     _asyncGetCallTrace = (AsyncGetCallTrace)dlsym(_libjvm, "AsyncGetCallTrace");
+    _getManagement = (JVM_GetManagement)dlsym(_libjvm, "JVM_GetManagement");
 
     if (attach) {
         ready();
@@ -174,6 +194,38 @@ void JNICALL VM::VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
 
 void JNICALL VM::VMDeath(jvmtiEnv* jvmti, JNIEnv* jni) {
     Profiler::_instance.shutdown(_agent_args);
+}
+
+jvmtiError VM::RedefineClassesHook(jvmtiEnv* jvmti, jint class_count, const jvmtiClassDefinition* class_definitions) {
+    atomicInc(_in_redefine_classes);
+    jvmtiError result = _orig_RedefineClasses(jvmti, class_count, class_definitions);
+
+    // jmethodIDs are invalidated after RedefineClasses
+    JNIEnv* env = jni();
+    for (int i = 0; i < class_count; i++) {
+        if (class_definitions[i].klass != NULL) {
+            loadMethodIDs(jvmti, env, class_definitions[i].klass);
+        }
+    }
+
+    atomicInc(_in_redefine_classes, -1);
+    return result;
+}
+
+jvmtiError VM::RetransformClassesHook(jvmtiEnv* jvmti, jint class_count, const jclass* classes) {
+    atomicInc(_in_redefine_classes);
+    jvmtiError result = _orig_RetransformClasses(jvmti, class_count, classes);
+
+    // jmethodIDs are invalidated after RetransformClasses
+    JNIEnv* env = jni();
+    for (int i = 0; i < class_count; i++) {
+        if (classes[i] != NULL) {
+            loadMethodIDs(jvmti, env, classes[i]);
+        }
+    }
+
+    atomicInc(_in_redefine_classes, -1);
+    return result;
 }
 
 

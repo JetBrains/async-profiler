@@ -55,9 +55,10 @@ enum StackRecovery {
     SCAN_STACK   = 4,
     LAST_JAVA_PC = 8,
     GC_TRACES    = 16,
+    CHECK_STATE  = 32,
 
     HOTSPOT_ONLY = LAST_JAVA_PC | GC_TRACES,
-    MAX_RECOVERY = MOVE_SP | POP_FRAME | SCAN_STACK | LAST_JAVA_PC | GC_TRACES
+    MAX_RECOVERY = 63
 };
 
 
@@ -262,6 +263,49 @@ const char* Profiler::findNativeMethod(const void* address) {
     return lib == NULL ? NULL : lib->binarySearch(address);
 }
 
+// When thread is in Java state, it should have Java frame somewhere on the top of the stack
+bool Profiler::checkWalkable(void* ucontext) {
+    if (ucontext == NULL) {
+        return false;
+    }
+
+    StackFrame frame(ucontext);
+    const void* pc = (const void*)frame.pc();
+    uintptr_t fp = frame.fp();
+    uintptr_t prev_fp = (uintptr_t)&fp;
+    uintptr_t bottom = prev_fp + 0x40000;
+
+    const void* const valid_pc = (const void*)0x1000;
+
+    // Walk until the bottom of the stack or until the first Java frame
+    for (int depth = 0; depth < 5 && pc >= valid_pc; depth++) {
+        if (_runtime_stubs.contains(pc)) {
+            _stubs_lock.lockShared();
+            jmethodID method = _runtime_stubs.find(pc);
+            _stubs_lock.unlockShared();
+            return method == NULL || strcmp((const char*)method, "call_stub") != 0;
+        } else if (_java_methods.contains(pc)) {
+            return true;
+        }
+
+        // Check if the next frame is below on the current stack
+        if (fp <= prev_fp || fp >= bottom) {
+            break;
+        }
+
+        // Frame pointer must be word aligned
+        if ((fp & (sizeof(uintptr_t) - 1)) != 0) {
+            break;
+        }
+
+        prev_fp = fp;
+        pc = ((const void**)fp)[1];
+        fp = ((uintptr_t*)fp)[0];
+    }
+
+    return false;
+}
+
 int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int tid) {
     const void* native_callchain[MAX_NATIVE_FRAMES];
     int native_frames = _engine->getNativeTrace(ucontext, tid, native_callchain, MAX_NATIVE_FRAMES,
@@ -286,6 +330,19 @@ int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int tid) {
 }
 
 int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max_depth) {
+    VMThread* vm_thread = VMThread::current();
+    if (vm_thread == NULL) {
+        return 0;
+    }
+
+    if (_safe_mode & CHECK_STATE) {
+        int state = vm_thread->state();
+        if ((state == 8 || state == 9) && !checkWalkable(ucontext)) {
+            // Thread is in Java state, but does not have a valid Java frame on top of the stack
+            return 0;
+        }
+    }
+
     JNIEnv* jni = VM::jni();
     if (jni == NULL) {
         // Not a Java thread
@@ -392,9 +449,11 @@ int Profiler::getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max
                 pc = 0;
             }
         }
-    } else if (trace.num_frames == ticks_GC_active && VMStructs::_get_stack_trace != NULL && !(_safe_mode & GC_TRACES)) {
-        // While GC is running Java threads are known to be at safepoint
-        return getJavaTraceJvmti((jvmtiFrameInfo*)frames, frames, max_depth);
+    } else if (trace.num_frames == ticks_GC_active && !(_safe_mode & GC_TRACES)) {
+        if (VMStructs::_get_stack_trace != NULL && CollectedHeap::isGCActive() && !VM::inRedefineClasses()) {
+            // While GC is running Java threads are known to be at safepoint
+            return getJavaTraceJvmti((jvmtiFrameInfo*)frames, frames, max_depth);
+        }
     }
 
     if (trace.num_frames > 0) {
@@ -538,7 +597,7 @@ void Profiler::recordSample(void* ucontext, u64 counter, jint event_type, jmetho
         // Events like object allocation happen at known places where it is safe to call JVM TI
         jvmtiFrameInfo* jvmti_frames = _calltrace_buffer[lock_index]->_jvmti_frames;
         num_frames += getJavaTraceJvmti(jvmti_frames + num_frames, frames + num_frames, _max_stack_depth);
-    } else if (VMStructs::hasJNIEnv()) {
+    } else {
         num_frames += getJavaTraceAsync(ucontext, frames + num_frames, _max_stack_depth);
     }
 
@@ -562,52 +621,82 @@ void Profiler::recordSample(void* ucontext, u64 counter, jint event_type, jmetho
 }
 
 jboolean JNICALL Profiler::NativeLibraryLoadTrap(JNIEnv* env, jobject self, jstring name, jboolean builtin) {
-    jboolean result = _instance._original_NativeLibrary_load(env, self, name, builtin);
+    jboolean result = ((jboolean JNICALL (*)(JNIEnv*, jobject, jstring, jboolean))
+                       _instance._original_NativeLibrary_load)(env, self, name, builtin);
+    _instance.updateSymbols(false);
+    return result;
+}
+
+jboolean JNICALL Profiler::NativeLibrariesLoadTrap(JNIEnv* env, jobject self, jobject lib, jstring name, jboolean builtin, jboolean jni) {
+    jboolean result = ((jboolean JNICALL (*)(JNIEnv*, jobject, jobject, jstring, jboolean, jboolean))
+                       _instance._original_NativeLibrary_load)(env, self, lib, name, builtin, jni);
     _instance.updateSymbols(false);
     return result;
 }
 
 void JNICALL Profiler::ThreadSetNativeNameTrap(JNIEnv* env, jobject self, jstring name) {
-    _instance._original_Thread_setNativeName(env, self, name);
+    ((void JNICALL (*)(JNIEnv*, jobject, jstring))_instance._original_Thread_setNativeName)(env, self, name);
     _instance.updateThreadName(VM::jvmti(), env, self);
 }
 
-void Profiler::bindNativeLibraryLoad(JNIEnv* env, NativeLoadLibraryFunc entry) {
-    jclass NativeLibrary = env->FindClass("java/lang/ClassLoader$NativeLibrary");
-    if (NativeLibrary == NULL) {
-        return;
-    }
+void Profiler::bindNativeLibraryLoad(JNIEnv* env, bool enable) {
+    jclass NativeLibrary;
 
-    // Find JNI entry for NativeLibrary.load() method
     if (_original_NativeLibrary_load == NULL) {
-        if (env->GetMethodID(NativeLibrary, "load0", "(Ljava/lang/String;Z)Z") != NULL) {
-            // JDK 9+
-            _load_method.name = (char*)"load0";
-            _load_method.signature = (char*)"(Ljava/lang/String;Z)Z";
-        } else if (env->GetMethodID(NativeLibrary, "load", "(Ljava/lang/String;Z)V") != NULL) {
-            // JDK 8
+        char original_jni_name[64];
+
+        if ((NativeLibrary = env->FindClass("jdk/internal/loader/NativeLibraries")) != NULL) {
+            strcpy(original_jni_name, "Java_jdk_internal_loader_NativeLibraries_");
+            _trapped_NativeLibrary_load = (void*)NativeLibrariesLoadTrap;
+
+            // JDK 15+
             _load_method.name = (char*)"load";
-            _load_method.signature = (char*)"(Ljava/lang/String;Z)V";
+            _load_method.signature = (char*)"(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z";
+
+        } else if ((NativeLibrary = env->FindClass("java/lang/ClassLoader$NativeLibrary")) != NULL) {
+            strcpy(original_jni_name, "Java_java_lang_ClassLoader_00024NativeLibrary_");
+            _trapped_NativeLibrary_load = (void*)NativeLibraryLoadTrap;
+
+            if (env->GetMethodID(NativeLibrary, "load0", "(Ljava/lang/String;Z)Z") != NULL) {
+                // JDK 9-14
+                _load_method.name = (char*)"load0";
+                _load_method.signature = (char*)"(Ljava/lang/String;Z)Z";
+            } else if (env->GetMethodID(NativeLibrary, "load", "(Ljava/lang/String;Z)V") != NULL) {
+                // JDK 8
+                _load_method.name = (char*)"load";
+                _load_method.signature = (char*)"(Ljava/lang/String;Z)V";
+            } else {
+                // JDK 7
+                _load_method.name = (char*)"load";
+                _load_method.signature = (char*)"(Ljava/lang/String;)V";
+            }
+
         } else {
-            // JDK 7
-            _load_method.name = (char*)"load";
-            _load_method.signature = (char*)"(Ljava/lang/String;)V";
+            fprintf(stderr, "WARNING: Failed to intercept NativeLibraries.load()\n");
+            return;
         }
 
-        char jni_name[64];
-        strcpy(jni_name, "Java_java_lang_ClassLoader_00024NativeLibrary_");
-        strcat(jni_name, _load_method.name);
-        _original_NativeLibrary_load = (NativeLoadLibraryFunc)dlsym(VM::_libjava, jni_name);
+        strcat(original_jni_name, _load_method.name);
+        if ((_original_NativeLibrary_load = dlsym(VM::_libjava, original_jni_name)) == NULL) {
+            fprintf(stderr, "WARNING: Could not find %s\n", original_jni_name);
+            return;
+        }
+
+    } else {
+        const char* class_name = _trapped_NativeLibrary_load == NativeLibrariesLoadTrap
+            ? "jdk/internal/loader/NativeLibraries"
+            : "java/lang/ClassLoader$NativeLibrary";
+        if ((NativeLibrary = env->FindClass(class_name)) == NULL) {
+            fprintf(stderr, "WARNING: Could not find %s\n", class_name);
+            return;
+        }
     }
 
-    // Change function pointer for the native method
-    if (_original_NativeLibrary_load != NULL) {
-        _load_method.fnPtr = (void*)entry;
-        env->RegisterNatives(NativeLibrary, &_load_method, 1);
-    }
+    _load_method.fnPtr = enable ? _trapped_NativeLibrary_load : _original_NativeLibrary_load;
+    env->RegisterNatives(NativeLibrary, &_load_method, 1);
 }
 
-void Profiler::bindThreadSetNativeName(JNIEnv* env, ThreadSetNativeNameFunc entry) {
+void Profiler::bindThreadSetNativeName(JNIEnv* env, bool enable) {
     jclass Thread = env->FindClass("java/lang/Thread");
     if (Thread == NULL) {
         return;
@@ -615,27 +704,21 @@ void Profiler::bindThreadSetNativeName(JNIEnv* env, ThreadSetNativeNameFunc entr
 
     // Find JNI entry for Thread.setNativeName() method
     if (_original_Thread_setNativeName == NULL) {
-        _original_Thread_setNativeName = (ThreadSetNativeNameFunc)dlsym(VM::_libjvm, "JVM_SetNativeThreadName");
+        _original_Thread_setNativeName = dlsym(VM::_libjvm, "JVM_SetNativeThreadName");
     }
 
     // Change function pointer for the native method
     if (_original_Thread_setNativeName != NULL) {
-        const JNINativeMethod setNativeName = {(char*)"setNativeName", (char*)"(Ljava/lang/String;)V", (void*)entry};
+        void* entry = enable ? (void*)ThreadSetNativeNameTrap : _original_Thread_setNativeName;
+        const JNINativeMethod setNativeName = {(char*)"setNativeName", (char*)"(Ljava/lang/String;)V", entry};
         env->RegisterNatives(Thread, &setNativeName, 1);
     }
 }
 
 void Profiler::switchNativeMethodTraps(bool enable) {
     JNIEnv* env = VM::jni();
-
-    if (enable) {
-        bindNativeLibraryLoad(env, NativeLibraryLoadTrap);
-        // bindThreadSetNativeName(env, ThreadSetNativeNameTrap);
-    } else {
-        bindNativeLibraryLoad(env, _original_NativeLibrary_load);
-        // bindThreadSetNativeName(env, _original_Thread_setNativeName);
-    }
-
+    bindNativeLibraryLoad(env, enable);
+    // bindThreadSetNativeName(env, enable);
     env->ExceptionClear();
 }
 
@@ -825,7 +908,7 @@ Error Profiler::start(Arguments& args, bool reset) {
     }
 
     if (args._output == OUTPUT_JFR) {
-        error = _jfr.start(args._file);
+        error = _jfr.start(args._file, reset);
         if (error) {
             return error;
         }
@@ -1143,9 +1226,13 @@ void Profiler::shutdown(Arguments& args) {
     MutexLocker ml(_state_lock);
 
     // The last chance to dump profile before VM terminates
-    if (_state == RUNNING && args._output != OUTPUT_NONE) {
-        args._action = ACTION_DUMP;
-        run(args);
+    if (_state == RUNNING) {
+        if (args._output == OUTPUT_NONE) {
+            stop();
+        } else {
+            args._action = ACTION_DUMP;
+            run(args);
+        }
     }
 
     _state = TERMINATED;

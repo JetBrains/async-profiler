@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.8.3] - 2021-01-06
+
+### Improvements
+ - libasyncProfiler.dylib symlink on macOS
+
+### Bug fixes
+ - Fixed possible deadlock on non-HotSpot JVMs
+ - Gracefully stop profiler when terminating JVM
+ - Fixed GetStackTrace problem after RedefineClasses
+
+## [1.8.2] - 2020-11-02
+
+### Improvements
+ - AArch64 build is now provided out of the box
+ - Compatibility with JDK 15 and JDK 16
+
+### Bug fixes
+ - More careful native stack walking in wall-clock mode
+ - `resume` command is not compatible with JFR format
+ - Wrong allocation sizes on JDK 8u262
+
 ## [1.8.1] - 2020-09-05
 
 ### Improvements

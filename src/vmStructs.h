@@ -39,10 +39,13 @@ class VMStructs {
     static int _methods_offset;
     static int _thread_osthread_offset;
     static int _thread_anchor_offset;
+    static int _thread_state_offset;
     static int _osthread_id_offset;
     static int _anchor_sp_offset;
     static int _anchor_pc_offset;
     static int _frame_size_offset;
+    static int _is_gc_active_offset;
+    static char* _collected_heap_addr;
 
     static jfieldID _eetop;
     static jfieldID _tid;
@@ -60,7 +63,8 @@ class VMStructs {
     static uintptr_t readSymbol(const char* symbol_name);
     static void initOffsets();
     static void initJvmFunctions();
-    static void initThreadBridge();
+    static void initThreadBridge(JNIEnv* env);
+    static void initLogging(JNIEnv* env);
 
     const char* at(int offset) {
         return (const char*)this + offset;
@@ -68,8 +72,6 @@ class VMStructs {
 
   public:
     static void init(NativeCodeCache* libjvm);
-
-    static bool hasJNIEnv();
 
     static NativeCodeCache* libjvm() {
         return _libjvm;
@@ -189,6 +191,8 @@ class VMKlass : VMStructs {
 
 class VMThread : VMStructs {
   public:
+    static VMThread* current();
+
     static VMThread* fromJavaThread(JNIEnv* env, jthread thread) {
         return (VMThread*)(uintptr_t)env->GetLongField(thread, _eetop);
     }
@@ -210,6 +214,10 @@ class VMThread : VMStructs {
         return *(int*)(osthread + _osthread_id_offset);
     }
 
+    int state() {
+        return _thread_state_offset >= 0 ? *(int*) at(_thread_state_offset) : 0;
+    }
+
     uintptr_t& lastJavaSP() {
         return *(uintptr_t*) (at(_thread_anchor_offset) + _anchor_sp_offset);
     }
@@ -227,6 +235,14 @@ class RuntimeStub : VMStructs {
 
     int frameSize() {
         return *(int*) at(_frame_size_offset);
+    }
+};
+
+class CollectedHeap : VMStructs {
+  public:
+    static bool isGCActive() {
+        return _collected_heap_addr != NULL && _is_gc_active_offset >= 0 &&
+               _collected_heap_addr[_is_gc_active_offset] != 0;
     }
 };
 
