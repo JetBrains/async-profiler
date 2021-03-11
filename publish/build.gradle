@@ -18,14 +18,19 @@ task allBinaries {
 
 def checkHaveAllBinaries(String path) {
     File pathFile = file(path)
-    List<String> systems = ["linux", "macos"]
-    List<String> binaries = ["jattach", "libasyncProfiler.so"]
-    systems.each { os ->
+    List<String> posixBinaries = ["jattach", "libasyncProfiler.so"]
+    List<String> windowsBinaries = ["libasyncProfiler.dll", "msdia140.dll"]
+    Map<String, List<String>> binaries = [
+            "linux": posixBinaries,
+            "macos": posixBinaries,
+            "windows": windowsBinaries
+    ]
+    binaries.each { os, files ->
         File osDir = new File(pathFile, os)
         if (!osDir.exists()) {
             throw new GradleException("Can't find '$os' directory in '$path'")
         }
-        binaries.each { binary ->
+        files.each { binary ->
             if (!new File(osDir, binary).exists()) {
                 throw new GradleException("Can't find '$binary' in '$osDir'")
             }
